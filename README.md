@@ -5,7 +5,7 @@ There are 4 different classes of files I rsync with different rules:
 - **AppConfig** folders are mirrored to the other host or user profile
 - **Executables** (mostly from ~/.local/bin) are copied and overwritten, but nothing is detleted.
 - **Dotfiles** are copyied and overwritten when they are newer than the version in the target profile.
-- **Certs and Keys** are only copied 
+- **Certs and Keys** are only copied when missing in the target path and never overwritten. Chmod 600.
 
 ## Install & run
 Clone repo, then run install.sh. After that:
