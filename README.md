@@ -3,8 +3,8 @@ Instead of managing dotfiles and other user config and profile setup in a repo o
 
 There are 4 different classes of files I rsync with different rules:
 - **AppConfig** folders are mirrored to the other host
-- **Executables** from ~/.local/bin are copied and overwritten, but never deleted
-- **Dotfiles** are copyied when missing, otherwise skipped.
+- **Executables** (mostly from ~/.local/bin) are copied and overwritten, but nothing is detleted.
+- **Dotfiles** are copyied and overwritten when they are newer than the version in the target profile.
 - **Certs and Keys** are only copied 
 
 ## Install & run
