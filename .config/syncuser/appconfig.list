@@ -1,0 +1,4 @@
+# App configs to mirror (overwrite + delete)
+
+$HOME/.config/nvim/
+

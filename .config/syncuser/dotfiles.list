@@ -1,0 +1,7 @@
+# Dotfiles: Copy only if missing
+
+$HOME/.bash_profile
+$HOME/.bashrc
+$HOME/.bashrc.d/
+$HOME/.gitconfig
+$HOME/.ssh/config

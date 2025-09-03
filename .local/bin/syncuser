@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# .local/bin/syncuser (wrapper)
+set -euo pipefail
+exec "${HOME}/.local/share/syncuser/main_syncuser.sh" "$@"
