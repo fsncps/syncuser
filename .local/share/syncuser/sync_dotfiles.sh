@@ -6,11 +6,13 @@ LIST="${1:-}"
 [[ -n "$LIST" ]] || die "missing dotfiles list"
 
 if [[ "${SYNCUSER_OVERWRITE:-0}" -eq 1 ]]; then
+   # overwrite regardless of mtime (includes dotfiles)
    RSYNC_OPTS="-azH"
    MODE="overwrite"
 else
-   RSYNC_OPTS="-azH --ignore-existing"
-   MODE="once"
+   # update-in-place: copy only when source is newer than target
+   RSYNC_OPTS="-azHu"
+   MODE="update"
 fi
 
 each_line "$LIST" | while IFS= read -r SRC; do
