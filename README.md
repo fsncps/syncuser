@@ -2,7 +2,7 @@
 Instead of managing dotfiles and other user config and profile setup in a repo or similar, I just sync them between users and hosts. Apart from the simplicity, I found it has advantages over managing a file tree or symlinks. The body of configs grows and evolves organically, with always several different versions live, which periodically sync and merge to or from each other.
 
 There are 4 different classes of files I rsync with different rules:
-- **AppConfig*** folders are mirrored to the other host
+- **AppConfig** folders are mirrored to the other host
 - **Executables** from ~/.local/bin are copied and overwritten, but never deleted
 - **Dotfiles** are copyied when missing, otherwise skipped.
 - **Certs and Keys** are only copied 
