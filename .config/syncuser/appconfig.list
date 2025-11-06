@@ -1,4 +1,8 @@
 # App configs to mirror (overwrite + delete)
 
+$HOME/.config/nvim/init.lua
 $HOME/.config/nvim/
+$HOME/.config/wezterm/
+$HOME/synctest
+$HOME/Downloads/Ehrhardt-etal_2021.zip
 

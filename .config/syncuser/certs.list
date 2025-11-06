@@ -1,7 +1,0 @@
-# Copy only if missing (unless -O); chmod 600
-
-$HOME/.ssh/id_ed25519
-$HOME/.ssh/id_ed25519.pub  
-#$HOME/.local/share/pki/rsyslog/ca.crt
-#$HOME/.local/share/pki/rsyslog/server.key
-

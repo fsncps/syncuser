@@ -5,3 +5,5 @@ $HOME/.bashrc
 $HOME/.bashrc.d/
 $HOME/.gitconfig
 $HOME/.ssh/config
+$HOME/.editorconfig
+$HOME/.harlequin.toml
