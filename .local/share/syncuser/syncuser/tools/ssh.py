@@ -3,6 +3,14 @@ from __future__ import annotations
 import os, re, socket, subprocess
 from pathlib import Path
 from typing import Optional
+from . import log_utils
+
+
+class PreflightFailure(Exception):
+    def __init__(self, exit_code: int, message: str):
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.message = message
 
 
 def _ssh_bin() -> str:
@@ -150,3 +158,65 @@ def dest_file_mtime(
         return float(r.stdout.strip())
     except Exception:
         return None
+
+
+# ---- one-call remote preflight (adds to buffer, raises on failure) ----
+
+
+def preflight_connect(
+    user: str,
+    host: str,
+    *,
+    buf: log_utils.StateBuffer,
+    resumed: bool,
+    persist: str = "15m",
+    timeout_ping: float = 1.5,
+    timeout_port: float = 2.0,
+) -> tuple[list[str], str]:
+    host_hdr = host_header(host)
+    icmp_ok, rtt = ping_rtt_ms(host, timeout_s=timeout_ping)
+    route = (
+        f"online (ping {rtt:.3f} ms)"
+        if (icmp_ok and rtt is not None)
+        else "ICMP blocked or unknown"
+    )
+    ssh_up = tcp_port_open(host, 22, timeout_s=timeout_port)
+    if not resumed:
+        buf.add_kv_pairs(
+            [
+                ("Host", host_hdr or "?"),
+                ("Remote user", user),
+                ("Route to host", route),
+                ("SSH port 22", "open" if ssh_up else "closed/unreachable"),
+                ("Logon", "attempting keyfile logon.."),
+            ]
+        )
+    if not ssh_up:
+        raise PreflightFailure(3, f"Cannot reach SSH on {host}:22 (user {user}).")
+
+    keys_ok = ssh_key_auth_works(user, host, timeout_s=4.0)
+    if not resumed:
+        buf.add_kv_pairs(
+            [
+                (
+                    "Logon",
+                    (
+                        "Key-based auth: OK."
+                        if keys_ok
+                        else "Key-based auth: not available. Prompted password."
+                    ),
+                )
+            ]
+        )
+
+    try:
+        control_path = start_ssh_master(user, host, persist=persist)
+        ssh_extra = ssh_opts_with_control(control_path)
+        if not resumed:
+            buf.add_kv_pairs([("Logon", "Authenticated. SSH ControlMaster active.")])
+    except Exception:
+        raise PreflightFailure(
+            4, "Authentication failed before remote queries (ControlMaster setup)."
+        )
+
+    return ssh_extra, control_path

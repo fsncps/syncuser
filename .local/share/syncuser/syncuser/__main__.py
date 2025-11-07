@@ -1,9 +1,5 @@
-# __main__.py
 from __future__ import annotations
-import argparse
-import os
-import sys
-import time
+import argparse, os, sys, time
 from dataclasses import replace
 from pathlib import Path
 from typing import List
@@ -13,7 +9,6 @@ from .log import setup_logging
 from .tools import ssh, identity, misc, log_utils
 from .sync import build_rsync_cmd, run_capture, parse_stats, parse_itemize
 
-# ----- constants / env keys -----
 ELEVATION_ENV_FLAG = "SYNCUSER_ELEVATED"
 STATE_ENV = "SYNCUSER_STATE_FILE"
 SYNCUSER_BASE = os.environ.get("SYNCUSER_BASE") or os.path.expanduser(
@@ -84,21 +79,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    # --- invoking user + real home (survives sudo) ---
+    # ---- invoker and HOME pinning ----
     src_user = identity.invoking_user()
     src_home = identity.resolve_home(user=src_user, host=None)
-
-    # Pin defaults to invoker's home
     os.environ["HOME"] = src_home
     os.environ.setdefault("XDG_CONFIG_HOME", str(Path(src_home) / ".config"))
 
-    # Force default config path to invoker's home if user didn’t override -c
-    default_cfg_cur_home = Path("~/.config/syncuser/syncuser_conf.toml").expanduser()
-    if args.config == default_cfg_cur_home:
+    # ---- config path (pin to invoker if default used) ----
+    default_cfg = Path("~/.config/syncuser/syncuser_conf.toml").expanduser()
+    if args.config == default_cfg:
         args.config = misc.expand_for_invoker(args.config, src_home=src_home)
     cfg_path = Path(args.config)
 
-    # --- load config (from invoker) ---
+    # ---- load config ----
     g, modules = load_config(cfg_path)
     modules = [
         replace(m, list_file=misc.expand_for_invoker(m.list_file, src_home=src_home))
@@ -116,7 +109,7 @@ def main() -> int:
 
     logger = setup_logging(g.log_file, g.verbose, silent=args.silent)
 
-    # ----- state buffer (under invoker home) -----
+    # ---- buffered header ----
     state_file = (
         Path(os.environ.get(STATE_ENV, ""))
         if os.environ.get(STATE_ENV)
@@ -127,99 +120,48 @@ def main() -> int:
     if resumed_lines:
         buf.lines.extend(resumed_lines)
     resumed = bool(resumed_lines)
+    log_utils.add_banner(buf, cfg_path, resumed=resumed)
 
     control_path: str | None = None
     try:
-        # --- deps ---
+        # ---- deps ----
         misc.ensure_deps(g.rsync_bin)
         if args.target_host:
             misc.ensure_deps("ssh")
 
         ssh_extra: list[str] = []
 
-        # ----- banner/preamble into buffer -----
-        if not resumed:
-            buf.add("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-            buf.add("┃                   SYNCUSER                    ┃")
-            buf.add("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-            buf.add_kv_pairs([("Config", str(cfg_path))])
-
+        # ---- remote preflight or local note ----
         if args.target_host:
-            host_hdr = ssh.host_header(args.target_host)
-            icmp_ok, rtt = ssh.ping_rtt_ms(args.target_host, timeout_s=1.5)
-            route = (
-                f"online (ping {rtt:.3f} ms)"
-                if (icmp_ok and rtt is not None)
-                else "ICMP blocked or unknown"
-            )
-            ssh_up = ssh.tcp_port_open(args.target_host, 22, timeout_s=2.0)
-            if not resumed:
-                buf.add_kv_pairs(
-                    [
-                        ("Host", host_hdr or "?"),
-                        ("Remote user", args.target_user),
-                        ("Route to host", route),
-                        ("SSH port 22", "open" if ssh_up else "closed/unreachable"),
-                        ("Logon", "attempting keyfile logon.."),
-                    ]
-                )
-            if not ssh_up:
-                log_utils.buffer_flush(buf, logger)
-                logger.error(
-                    f"Cannot reach SSH on {args.target_host}:22 (user {args.target_user})."
-                )
-                return 3
-            keys_ok = ssh.ssh_key_auth_works(
-                args.target_user, args.target_host, timeout_s=4.0
-            )
-            if not resumed:
-                buf.add_kv_pairs(
-                    [
-                        (
-                            "Logon",
-                            (
-                                "Key-based auth: OK."
-                                if keys_ok
-                                else "Key-based auth: not available. Prompted password."
-                            ),
-                        )
-                    ]
-                )
             try:
-                control_path = ssh.start_ssh_master(
-                    args.target_user, args.target_host, persist="15m"
+                ssh_extra, control_path = ssh.preflight_connect(
+                    args.target_user,
+                    args.target_host,
+                    buf=buf,
+                    resumed=resumed,
+                    persist="15m",
                 )
-                ssh_extra = ssh.ssh_opts_with_control(control_path)
-                if not resumed:
-                    buf.add_kv_pairs(
-                        [("Logon", "Authenticated. SSH ControlMaster active.")]
-                    )
-            except Exception:
+            except ssh.PreflightFailure as e:
                 log_utils.buffer_flush(buf, logger)
-                logger.error(
-                    "Authentication failed before remote queries (ControlMaster setup)."
-                )
-                return 4
+                logger.error(e.message)
+                return e.exit_code
         else:
             if not resumed:
                 buf.add_kv_pairs([("Host", "(local)"), ("Logon", "Local session")])
 
-        # ----- destination identity -----
-        if args.target_host is None:  # local target
-            dest_home = identity.local_home_of(args.target_user)
-        else:
-            dest_home = identity.resolve_home(user=args.target_user, host=args.target_host, ssh_extra=ssh_extra)  # type: ignore[arg-type]
+        # ---- destination identity ----
+        dest_home, dest_group = identity.resolve_dest(
+            args.target_user, args.target_host, ssh_extra=ssh_extra
+        )
 
-        dest_group = identity.resolve_primary_group(user=args.target_user, host=args.target_host, ssh_extra=ssh_extra)  # type: ignore[arg-type]
-
-        # ----- sudo allowance -----
+        # ---- sudo allowance ----
         if args.target_host:
             pwless = identity.has_passwordless_sudo_remote(args.target_user, args.target_host, ssh_extra=ssh_extra)  # type: ignore[arg-type]
         else:
             pwless = identity.has_passwordless_sudo_local()
         sudo_allowed = pwless or args.sudo or g.prompt_sudo_passwd
 
-        # ----- SUDO/Target + Permission (still buffered) -----
+        # ---- header SUDO/Target + local perm handling ----
         where = "remote" if args.target_host else "local"
         target_header_path = (
             f"{args.target_user}@{args.target_host}:{dest_home}"
@@ -234,9 +176,9 @@ def main() -> int:
             ]
         )
 
-        if args.target_host is None:  # local target
+        if args.target_host is None:
             mode, ok, exists = identity.local_perm_info(
-                dest_home, sudo_active=identity.is_unix_root()
+                dest_home, sudo_active=sudo_active
             )
             if not exists:
                 log_utils.buffer_flush(buf, logger)
@@ -271,11 +213,11 @@ def main() -> int:
                 return 1
             buf.add("Permission:      assumed OK (remote target preflight skipped)")
 
-        # ----- FLUSH header once -----
+        # ---- flush header once ----
         if not args.silent:
             log_utils.buffer_flush(buf, logger)
 
-        # ----- filter modules -----
+        # ---- module filter ----
         if args.module:
             wanted = set(args.module)
             modules = [m for m in modules if m.name in wanted]
@@ -289,7 +231,7 @@ def main() -> int:
         # local sudo prefix
         sudo_prefix: List[str] = []
         if (
-            (not args.target_host)
+            (args.target_host is None)
             and (args.target_user != identity.invoking_user())
             and sudo_allowed
         ):
@@ -313,7 +255,6 @@ def main() -> int:
                     disp = raw.strip()
                     abs_src = misc.expand_for_source(disp, src_home)
 
-                    # ensure mapping from src_home
                     if not misc.path_is_under(abs_src, src_home):
                         logger.error(
                             f"{disp}: must reside under source home {src_home}. Skipping."
@@ -324,17 +265,12 @@ def main() -> int:
                         abs_src, src_home, dest_home
                     ).replace("$HOME", dest_home)
 
-                    # Preflight
                     src_is_file = Path(abs_src).is_file()
                     src_exists = Path(abs_src).exists()
                     src_mtime = misc.src_file_mtime(abs_src) if src_is_file else None
 
                     dest_existed_before = ssh.dest_path_exists(args.target_user, args.target_host, abs_dst, ssh_extra=ssh_extra)  # type: ignore[arg-type]
-                    dest_mtime_before = (
-                        ssh.dest_file_mtime(args.target_user, args.target_host, abs_dst, ssh_extra=ssh_extra)  # type: ignore[arg-type]
-                        if src_is_file
-                        else None
-                    )
+                    dest_mtime_before = ssh.dest_file_mtime(args.target_user, args.target_host, abs_dst, ssh_extra=ssh_extra) if src_is_file else None  # type: ignore[arg-type]
 
                     dst_path_for_rsync = (
                         f"{args.target_user}@{args.target_host}:{abs_dst}"
@@ -384,18 +320,8 @@ def main() -> int:
                             copied = transferred_stats
                         deleted_total = deleted_stats
                         skipped = max(0, total_files - copied) if total_files > 0 else 0
-                        if copied > 0:
-                            logger.transfer(
-                                f"{misc.resolve_env_path(disp)}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}"
-                            )
-                        elif deleted_total > 0:
-                            logger.notice(
-                                f"{misc.resolve_env_path(disp)}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}"
-                            )
-                        else:
-                            logger.notice(
-                                f"{misc.resolve_env_path(disp)}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}"
-                            )
+                        msg = f"{misc.resolve_env_path(disp)}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}"
+                        (logger.transfer if copied > 0 else logger.notice)(msg)
                     else:
                         source_missing = not src_exists
                         if source_missing:
@@ -417,32 +343,14 @@ def main() -> int:
                                         f"{misc.resolve_env_path(disp)}: Target not found. CREATED new file.{chown_note}"
                                     )
                                 else:
-                                    if (
-                                        src_mtime is not None
-                                        and dest_mtime_before is not None
-                                        and src_mtime > dest_mtime_before
-                                    ):
-                                        logger.transfer(
-                                            f"{misc.resolve_env_path(disp)}: Target out of date. UPDATED file.{chown_note}"
-                                        )
-                                    else:
-                                        logger.transfer(
-                                            f"{misc.resolve_env_path(disp)}: Target out of date. UPDATED file.{chown_note}"
-                                        )
+                                    logger.transfer(
+                                        f"{misc.resolve_env_path(disp)}: Target out of date. UPDATED file.{chown_note}"
+                                    )
                             else:
                                 if dest_existed_before:
-                                    if (
-                                        src_mtime is not None
-                                        and dest_mtime_before is not None
-                                        and src_mtime <= dest_mtime_before
-                                    ):
-                                        logger.notice(
-                                            f"{misc.resolve_env_path(disp)}: Target identical, SKIPPED file."
-                                        )
-                                    else:
-                                        logger.notice(
-                                            f"{misc.resolve_env_path(disp)}: Target identical, SKIPPED file."
-                                        )
+                                    logger.notice(
+                                        f"{misc.resolve_env_path(disp)}: Target identical, SKIPPED file."
+                                    )
                                 else:
                                     logger.notice(
                                         f"{misc.resolve_env_path(disp)}: SKIPPED file."
@@ -461,7 +369,6 @@ def main() -> int:
                 and (args.target_host is None)
                 and not identity.is_unix_root()
             ):
-
                 os.environ[STATE_ENV] = str(state_file)
                 buf.add("Permission:   ERROR during operation; restarting with sudo…")
                 buf.write_and_close()

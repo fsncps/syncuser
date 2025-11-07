@@ -38,7 +38,6 @@ def resolve_home(
         if not user or user == (os.environ.get("USER") or ""):
             return str(Path.home())
         return pwd.getpwnam(user).pw_dir
-    # remote: delegate via ssh
     from .ssh import _ssh_cmd
 
     p = subprocess.run(
@@ -77,6 +76,19 @@ def local_home_of(user: str) -> str:
         return pwd.getpwnam(user).pw_dir
     except KeyError:
         return str(Path(f"~{user}").expanduser())
+
+
+def resolve_dest(
+    user: str, host: Optional[str], *, ssh_extra: Optional[list[str]] = None
+) -> tuple[str, str]:
+    """Return (dest_home, dest_primary_group) for local or remote."""
+    dest_home = (
+        local_home_of(user)
+        if host is None
+        else resolve_home(user=user, host=host, ssh_extra=ssh_extra)
+    )
+    dest_group = resolve_primary_group(user=user, host=host, ssh_extra=ssh_extra)
+    return dest_home, dest_group
 
 
 # ---- permissions & sudo ----

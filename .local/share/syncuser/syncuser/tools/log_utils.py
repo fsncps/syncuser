@@ -1,6 +1,6 @@
 # syncuser/tools/log_utils.py
 from __future__ import annotations
-import os, sys, re
+import os, sys
 from pathlib import Path
 
 # ---- header buffer / banner lines ----
@@ -35,6 +35,15 @@ class StateBuffer:
 def buffer_flush(buf: StateBuffer, logger) -> None:
     for line in buf.lines:
         (logger.title if line.startswith(("┏", "┃", "┗")) else logger.info)(line)
+
+
+def add_banner(buf: StateBuffer, cfg_path: Path, *, resumed: bool) -> None:
+    if resumed:
+        return
+    buf.add("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
+    buf.add("┃                   SYNCUSER                    ┃")
+    buf.add("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
+    buf.add_kv_pairs([("Config", str(cfg_path))])
 
 
 # ---- key/value blocks ----
