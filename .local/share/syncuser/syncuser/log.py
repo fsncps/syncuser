@@ -2,7 +2,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from .tools import supports_color, colorize
+from .tools.log_utils import supports_color, colorize
 
 try:
     import colorama  # type: ignore
