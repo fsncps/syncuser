@@ -1,11 +1,9 @@
 # __main__.py (drop-in)
 from __future__ import annotations
-import argparse, os, pwd, sys, errno, subprocess
+import argparse, os, sys, errno, subprocess, shutil, logging, time, re, pwd
 from dataclasses import replace
 from pathlib import Path
-from typing import List
-import time
-import re
+from typing import List, Tuple
 
 from .config import load_config
 from .log import setup_logging
@@ -34,34 +32,180 @@ from .tools import (
 )
 from .sync import build_rsync_cmd, run_capture, parse_stats, parse_itemize
 
+# ----- constants / env keys -----
 ELEVATION_ENV_FLAG = "SYNCUSER_ELEVATED"
+STATE_ENV = "SYNCUSER_STATE_FILE"
+SYNCUSER_BASE = os.environ.get("SYNCUSER_BASE") or os.path.expanduser("~/.local/share/syncuser")
+
+log = logging.getLogger(__name__)
+
+_RSPEED_RE = re.compile(r"speedup is ([0-9.]+)", re.I)
+_RBYTES_RE = re.compile(r"Total transferred file size:\s*([\d,]+) bytes", re.I)
+
+def _resolve_env_path(s: str) -> str:
+    return os.path.expandvars(s).replace("$HOME", os.path.expanduser("~"))
+
+# ----- state buffer for cross-reexec header continuity -----
+class StateBuffer:
+    def __init__(self, path: Path):
+        self.path = path
+        self.lines: list[str] = []
+
+    def add(self, line: str) -> None:
+        self.lines.append(line)
+
+    def add_kv_pairs(self, pairs: list[tuple[str, str]]) -> None:
+        # reuse your kv formatting
+        from .tools import _kv_lines as kv
+        self.lines.extend(kv(pairs).splitlines())
+
+    def write_and_close(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
+
+    def read_and_clear(self) -> list[str]:
+        if not self.path.exists():
+            return []
+        text = self.path.read_text(encoding="utf-8")
+        try:
+            self.path.unlink()
+        except Exception:
+            pass
+        return text.rstrip("\n").splitlines() if text else []
 
 
-def _render_header(
-    *,
-    target_path: str,
-    where: str,
-    host_hdr: str,
-    config_path: Path,
-    dry_run: bool,
-    modules_selected: list[str] | None,
-    overwrite: bool,
-    sudo_mode: str,
-) -> str:
-    lines: list[str] = []
-    lines.append(f"SUDO   : {sudo_mode}")
-    lines.append(f"Target : {target_path} ({where})")
-    if dry_run:
-        lines.append("DRY RUN. rsync transfer forecast only.")
-    if modules_selected:
-        lines.append(f"Modules: {', '.join(modules_selected)}")
-    if overwrite:
-        lines.append("OVERWRITING EVERYTHING.")
-    return "\n".join(lines)
+# ----- helpers -----
+def expand_for_invoker(pathlike, *, src_home: str) -> Path:
+    """Expand ~ and $HOME but force them to the invoking user's home."""
+    s = str(pathlike)
+    s = s.replace("$HOME", src_home)
+    if s.startswith("~"):
+        s = src_home + s[1:]
+    return Path(s)
 
 
-def _module_title(name: str) -> str:
-    return f"\n=== Module: {name} ==="
+def shq(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _local_perm_info(dest_home: str, *, sudo_active: bool) -> Tuple[str, bool, bool]:
+    """Return (mode_str, ok, exists) for a local target dir."""
+    if not os.path.isdir(dest_home):
+        return ("-", False, False)
+    try:
+        st = os.stat(dest_home)
+        mode = f"{st.st_mode & 0o777:o}"
+    except Exception:
+        return ("-", False, True)
+    if sudo_active:
+        return (mode, True, True)
+    ok = os.access(dest_home, os.W_OK | os.X_OK)
+    return (mode, ok, True)
+
+
+def _remote_perm_info(
+    user: str, host: str, dest_home: str, *, ssh_extra: list[str], sudo_allowed: bool
+) -> Tuple[str, bool, bool]:
+    """Return (mode_str, ok, exists) for a remote target dir."""
+    rc, _, _ = run_capture(
+        ["ssh", *ssh_extra, f"{user}@{host}", "--", "sh", "-lc", f"[ -d {shq(dest_home)} ]"],
+        echo=False,
+        echo_cmd=False,
+    )
+    if rc != 0:
+        return ("-", False, False)
+
+    rc, out, _ = run_capture(
+        ["ssh", *ssh_extra, f"{user}@{host}", "--", "sh", "-lc", f"stat -c %a {shq(dest_home)} || stat -f %Mp%Lp {shq(dest_home)}"],
+        echo=False,
+        echo_cmd=False,
+    )
+    mode = out.strip() if rc == 0 and out.strip() else "-"
+
+    rc, _, _ = run_capture(
+        ["ssh", *ssh_extra, f"{user}@{host}", "--", "sh", "-lc", f"[ -w {shq(dest_home)} ] && [ -x {shq(dest_home)} ]"],
+        echo=False,
+        echo_cmd=False,
+    )
+    ok = (rc == 0) or bool(sudo_allowed)
+    return (mode, ok, True)
+
+
+def _invoking_user() -> str:
+    try:
+        euid = os.geteuid()
+    except AttributeError:
+        euid = None
+    if euid == 0:
+        su = os.environ.get("SUDO_USER")
+        if su:
+            return su
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return os.environ.get("USER") or "unknown"
+
+
+def _host_header(host: str | None) -> str:
+    if host is None:
+        return "localhost"
+    if is_ip_literal(host):
+        return host
+    ip = resolve_host_ip(host)
+    return f"{host} [{ip}]" if ip else host
+
+
+def _is_local_target(host: str | None) -> bool:
+    return host is None
+
+
+def _is_unix_root() -> bool:
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
+
+
+def _expand_for_source(path_str: str, src_home: str) -> str:
+    s = path_str.strip()
+    s = os.path.expandvars(s)
+    s = s.replace("$HOME", src_home)
+    if s.startswith("~"):
+        s = src_home + s[1:]
+    p = Path(s)
+    if not p.is_absolute():
+        raise SystemExit(f"List entry must expand to an absolute path: {path_str!r} → {s!r}")
+    return str(p)
+
+
+def reexec_with_sudo(extra_args: list[str] | None = None) -> "NoReturn":
+    """Exec into sudo + venv python, preserving our env (HOME too!) and state file."""
+    if os.environ.get(ELEVATION_ENV_FLAG) == "1":
+        print("Permission:   ERROR: Elevation loop detected. Aborting.", file=sys.stderr)
+        os._exit(1)
+
+    base = SYNCUSER_BASE
+    venv_py = os.path.join(base, ".venv", "bin", "python3")
+    if not os.path.exists(venv_py):
+        print(f"[err] venv python not found: {venv_py}", file=sys.stderr)
+        os._exit(1)
+
+    env = os.environ.copy()
+    # Make module path discoverable and keep HOME pinned to invoker's home
+    env["PYTHONPATH"] = f"{base}:{env.get('PYTHONPATH','')}"
+    env["SYNCUSER_BASE"] = base
+    env[ELEVATION_ENV_FLAG] = "1"
+    # IMPORTANT: preserve HOME so defaults point to invoker's config, not /root
+    preserve = "HOME,PYTHONPATH,SYNCUSER_BASE," + ELEVATION_ENV_FLAG
+    if STATE_ENV in env:
+        preserve += "," + STATE_ENV
+
+    sudo = shutil.which("sudo") or "/usr/bin/sudo"
+    argv = [sudo, f"--preserve-env={preserve}", venv_py, "-m", "syncuser"]
+    argv += (extra_args or sys.argv[1:])
+
+    # Replace current process; no parent to throw tracebacks
+    os.execvpe(sudo, argv, env)
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,100 +268,32 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _invoking_user() -> str:
-    try:
-        euid = os.geteuid()
-    except AttributeError:
-        euid = None
-    if euid == 0:
-        su = os.environ.get("SUDO_USER")
-        if su:
-            return su
-    try:
-        import pwd  # lazy import for windows compat
-        return pwd.getpwuid(os.getuid()).pw_name  # type: ignore[attr-defined]
-    except Exception:
-        return os.environ.get("USER") or "unknown"
-
-
-def _host_header(host: str | None) -> str:
-    if host is None:
-        return "localhost"
-    if is_ip_literal(host):
-        return host
-    ip = resolve_host_ip(host)
-    return f"{host} [{ip}]" if ip else host
-
-
-_RSPEED_RE = re.compile(r"speedup is ([0-9.]+)", re.I)
-_RBYTES_RE = re.compile(r"Total transferred file size:\s*([\d,]+) bytes", re.I)
-
-
-def _extract_summary_stats(out: str) -> dict[str, float]:
-    stats = {"bytes": 0.0, "deleted": 0.0, "speedup": 0.0}
-    m = _RBYTES_RE.search(out)
-    if m:
-        stats["bytes"] = float(m.group(1).replace(",", ""))
-    m = _RSPEED_RE.search(out)
-    if m:
-        stats["speedup"] = float(m.group(1))
-    deleted_match = re.search(r"Number of deleted files:\s*([0-9]+)", out)
-    if deleted_match:
-        stats["deleted"] = float(deleted_match.group(1))
-    return stats
-
-
-def _human_bytes(num: float) -> str:
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if num < 1024:
-            return f"{num:,.1f} {unit}"
-        num /= 1024
-    return f"{num:,.1f} PiB"
-
-
-def _is_local_target(host: str | None) -> bool:
-    return host is None
-
-
-def _is_unix_root() -> bool:
-    try:
-        return os.geteuid() == 0
-    except AttributeError:
-        return False
-
-
-def _reexec_with_sudo(argv: list[str], *, log, reason_path: str | None = None) -> "NoReturn":
-    if os.environ.get(ELEVATION_ENV_FLAG) == "1":
-        log.error("Elevation loop detected; already attempted sudo. Aborting.")
-        raise SystemExit(1)
-    if reason_path:
-        log.error(f"{reason_path}: Permission denied.")
-    log.notice("Resetting application with --sudo flag...")
-    new_env = dict(os.environ)
-    new_env[ELEVATION_ENV_FLAG] = "1"
-    py = sys.executable
-    new_argv = argv[1:]
-    if "--sudo" not in new_argv and "-S" not in new_argv:
-        new_argv = ["--sudo", *new_argv]
-    cmd = ["sudo", "-E", py, "-m", "syncuser", *new_argv]
-    os.execve("/usr/bin/sudo", cmd, new_env)
-
-
-def _expand_for_source(path_str: str, src_home: str) -> str:
-    s = path_str.strip()
-    s = os.path.expandvars(s)
-    s = s.replace("$HOME", src_home)
-    if s.startswith("~"):
-        s = src_home + s[1:]
-    p = Path(s)
-    if not p.is_absolute():
-        raise SystemExit(f"List entry must expand to an absolute path: {path_str!r} → {s!r}")
-    return str(p)
-
-
 def main() -> int:
     args = parse_args()
-    g, modules = load_config(args.config)
+
+    # --- invoking user + real home (survives sudo) ---
+    src_user = _invoking_user()
+    src_home = resolve_home(user=src_user, host=None)
+
+    # Keep defaults pinned to invoker's home (so expanduser inside helpers points there)
+    os.environ["HOME"] = src_home
+    os.environ.setdefault("XDG_CONFIG_HOME", str(Path(src_home) / ".config"))
+
+    # Force default config path to invoker's home if user didn't override -c
+    default_cfg_cur_home = Path("~/.config/syncuser/syncuser_conf.toml").expanduser()
+    if args.config == default_cfg_cur_home:
+        args.config = expand_for_invoker(args.config, src_home=src_home)
+    cfg_path = Path(args.config)
+
+    # --- load config (from invoker) ---
+    g, modules = load_config(cfg_path)
+    # rewrite frozen modules with list_file pinned to invoker's home
+    # AFTER (keeps Path; read_list_file(Path) works)
+    modules = [
+        replace(m, list_file=expand_for_invoker(m.list_file, src_home=src_home))
+        for m in modules
+    ]
+
 
     start_time = time.time()
     total_transferred_bytes = 0.0
@@ -228,113 +304,161 @@ def main() -> int:
     effective_verbose = (not args.no_verbose) and g.verbose and (not args.silent)
     g = replace(g, dry_run=(args.dry_run or g.dry_run), verbose=effective_verbose)
 
-    log = setup_logging(g.log_file, g.verbose, silent=args.silent)
+    logger = setup_logging(g.log_file, g.verbose, silent=args.silent)
+    globals()["log"] = logger
+
+    # ----- state buffer path (under invoker's home) -----
+    state_file = Path(os.environ.get(STATE_ENV, "")) if os.environ.get(STATE_ENV) else Path(src_home) / ".local/state/syncuser/header.tmp"
+    buf = StateBuffer(state_file)
+    # If child run (after sudo), read previous header but DO NOT print yet; we append and flush once.
+    resumed_lines = buf.read_and_clear()
+    if resumed_lines:
+        buf.lines.extend(resumed_lines)
+
+    resumed = bool(resumed_lines)
 
     control_path: str | None = None
     try:
-        # --- deps & reachability ---
+        # --- deps ---
         ensure_deps(g.rsync_bin)
         if args.target_host:
             ensure_deps("ssh")
 
-            # Early status block
-            if not args.silent:
-                host_hdr = _host_header(args.target_host)
-                box = [
-                    "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓",
-                    "┃                   SYNCUSER                    ┃",
-                    "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛",
-                ]
-                log.title("\n".join(box))
+        icmp_ok = None
+        rtt = None
+        ssh_up = None
+        ssh_extra: list[str] = []
 
-                icmp_ok, rtt = ping_rtt_ms(args.target_host, timeout_s=1.5)
-                route = f"online (ping {rtt} ms)" if (icmp_ok and rtt is not None) else "ICMP blocked or unknown"
-                ssh_up = tcp_port_open(args.target_host, 22, timeout_s=2.0)
-                ssh_line = "open" if ssh_up else "closed/unreachable"
+        # ----- Build banner/preamble into buffer (no printing yet) -----
+# ----- Build banner/preamble into buffer (no printing yet) -----
+        if not resumed:
+            buf.add("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
+            buf.add("┃                   SYNCUSER                    ┃")
+            buf.add("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
+            buf.add_kv_pairs([("Config", str(cfg_path))])
 
-                log.info(_kv_lines([
-                    ("Config",       str(args.config)),
-                    ("Host",         host_hdr),
-                    ("Remote user",  args.target_user),
-                    ("Route to host",route),
-                    ("SSH port 22",  ssh_line),
-                    ("Logon",        "attempting keyfile logon.."),
-                ]))
-
-
+        if args.target_host:
+            host_hdr = _host_header(args.target_host)
+            route = "ICMP blocked or unknown"
+            icmp_ok, rtt = ping_rtt_ms(args.target_host, timeout_s=1.5)
+            if icmp_ok and rtt is not None:
+                route = f"online (ping {rtt:.3f} ms)"
+            ssh_up = tcp_port_open(args.target_host, 22, timeout_s=2.0)
+            if not resumed:
+                buf.add_kv_pairs([
+                    ("Host", host_hdr or "?"),
+                    ("Remote user", args.target_user),
+                    ("Route to host", route),
+                    ("SSH port 22", "open" if ssh_up else "closed/unreachable"),
+                    ("Logon", "attempting keyfile logon.."),
+                ])
             if not tcp_port_open(args.target_host, 22, timeout_s=2.0):
-                if not args.silent:
-                    log.error(f"Cannot reach SSH on {args.target_host}:22 (user {args.target_user}).")
+                # flush and abort
+                for line in buf.lines:
+                    if line.startswith(("┏","┃","┗")): logger.title(line)
+                    else: logger.info(line)
+                logger.error(f"Cannot reach SSH on {args.target_host}:22 (user {args.target_user}).")
                 return 3
-
             keys_ok = ssh_key_auth_works(args.target_user, args.target_host, timeout_s=4.0)
-            if not args.silent:
-                log.info(_kv_lines([("Logon", "Key-based auth: OK." if keys_ok else "Key-based auth: not available. Will allow password prompt.")]))
-
-            # Bring up ControlMaster now (this is where password prompt happens if keys fail)
+            if not resumed:
+                buf.add_kv_pairs([("Logon", "Key-based auth: OK." if keys_ok else "Key-based auth: not available. Prompted password.")])
             try:
                 control_path = start_ssh_master(args.target_user, args.target_host, persist="15m")
-                if not args.silent:
-                    log.info(_kv_lines([("Logon", "Authenticated. SSH ControlMaster active.")]))
+                ssh_extra = ssh_opts_with_control(control_path)
+                if not resumed:
+                    buf.add_kv_pairs([("Logon", "Authenticated. SSH ControlMaster active.")])
             except subprocess.CalledProcessError:
-                if not args.silent:
-                    log.error("Authentication failed before remote queries (ControlMaster setup).")
+                for line in buf.lines:
+                    if line.startswith(("┏","┃","┗")): logger.title(line)
+                    else: logger.info(line)
+                logger.error("Authentication failed before remote queries (ControlMaster setup).")
                 return 4
+        else:
+            if not resumed:
+                buf.add_kv_pairs([("Host", "(local)"), ("Logon", "Local session")])
 
-        # ----- Resolve identities/homes -----
-        src_user = _invoking_user()
-        src_home = resolve_home(user=src_user, host=None)
 
-        ssh_extra = ssh_opts_with_control(control_path) if args.target_host else []
+        # ----- destination identity -----
+        if _is_local_target(args.target_host):
+            # For local dest, ignore HOME; resolve via pwd for the target user
+            try:
+                dest_home = pwd.getpwnam(args.target_user).pw_dir
+            except KeyError:
+                # fallback to your helper if user missing
+                dest_home = resolve_home(user=args.target_user, host=None)
+        else:
+            dest_home = resolve_home(user=args.target_user, host=args.target_host, ssh_extra=ssh_extra)  # type: ignore[arg-type]
 
-        dest_home = resolve_home(user=args.target_user, host=args.target_host, ssh_extra=ssh_extra)  # type: ignore[arg-type]
         dest_group = resolve_primary_group(user=args.target_user, host=args.target_host, ssh_extra=ssh_extra)  # type: ignore[arg-type]
 
-        # --- EARLY ELEVATION for local runs ---
-        if _is_local_target(args.target_host) and not _is_unix_root():
-            needs_elevate = args.target_user != src_user
-            try:
-                if not os.path.exists(dest_home) or not os.access(dest_home, os.R_OK):
-                    needs_elevate = True
-            except Exception:
-                needs_elevate = True
-            pwless_local = has_passwordless_sudo_local()
-            may_prompt = args.sudo or g.prompt_sudo_passwd
-            if needs_elevate and (pwless_local or may_prompt):
-                _reexec_with_sudo(sys.argv, log=log, reason_path=dest_home)
-
-        # --- sudo capability (for banner + rsync) ---
+        # ----- sudo allowance -----
         if args.target_host:
             pwless = has_passwordless_sudo_remote(args.target_user, args.target_host, ssh_extra=ssh_extra)  # type: ignore[arg-type]
         else:
             pwless = has_passwordless_sudo_local()
         sudo_allowed = pwless or args.sudo or g.prompt_sudo_passwd
-        sudo_mode = "YES" if (pwless or _is_unix_root()) else ("YES (prompt)" if sudo_allowed else "NO")
 
-        # --- header ---
+        # ----- SUDO/Target + Permission (still buffered) -----
+        where = "remote" if args.target_host else "local"
+        target_header_path = f"{args.target_user}@{args.target_host}:{dest_home}" if args.target_host else dest_home
+        sudo_active = _is_unix_root()
+        sudo_mode_display = "YES" if sudo_active else "NO"
+        # Only add SUDO/Target if we didn't already print them in the previous pass
+        buf.add_kv_pairs([("SUDO", sudo_mode_display), ("Target", f"{target_header_path} ({where})")])
+
+
+        if _is_local_target(args.target_host):
+            mode, ok, exists = _local_perm_info(dest_home, sudo_active=_is_unix_root())
+            if not exists:
+                for line in buf.lines:
+                    if line.startswith(("┏","┃","┗")): logger.title(line)
+                    else: logger.info(line)
+                logger.error(f"Target does not exist: {dest_home}")
+                return 1
+            if ok:
+                buf.add(f"Permission:      {mode} (OK)")
+            else:
+                if sudo_allowed:
+                    buf.add("Permission:      ERROR: Permission denied at target.")
+                    buf.add("Permission:      Restarting with sudo…")
+                    # persist buffer and exec; child will read, append, and flush later
+                    os.environ[STATE_ENV] = str(state_file)
+                    buf.write_and_close()
+                    reexec_with_sudo(["--sudo", *sys.argv[1:]])
+                else:
+                    for line in buf.lines:
+                        if line.startswith(("┏","┃","┗")): logger.title(line)
+                        else: logger.info(line)
+                    logger.error("Permission:      ERROR: Permission denied at target and sudo not allowed.")
+                    return 5
+        else:
+            # --- remote target: trust resolve_home() and skip permission stat checks ---
+            if not dest_home:
+                for line in buf.lines:
+                    if line.startswith(("┏","┃","┗")):
+                        logger.title(line)
+                    else:
+                        logger.info(line)
+                logger.error(f"Could not resolve remote home for {args.target_user}@{args.target_host}")
+                return 1
+
+            buf.add(f"Permission:      assumed OK (remote target preflight skipped)")
+
+
+        # ----- At this point, we are allowed to proceed; FLUSH header once -----
         if not args.silent:
-            where = "remote" if args.target_host else "local"
-            target_header_path = f"{args.target_user}@{args.target_host}:{dest_home}" if args.target_host else dest_home
-            header_pairs = [
-                ("SUDO",   sudo_mode),
-                ("Target", f"{target_header_path} ({where})"),
-            ]
-            if g.dry_run:
-                header_pairs.append(("Note", "DRY RUN. rsync transfer forecast only."))
-            if args.module:
-                header_pairs.append(("Modules", ", ".join(m.name for m in modules)))
-            if args.overwrite:
-                header_pairs.append(("Note", "OVERWRITING EVERYTHING."))
-            log.info(_kv_lines(header_pairs))
+            for line in buf.lines:
+                if line.startswith(("┏","┃","┗")):
+                    logger.title(line)
+                else:
+                    logger.info(line)
 
-
-        # --- filter modules ---
+        # ----- filter modules -----
         if args.module:
             wanted = set(args.module)
             modules = [m for m in modules if m.name in wanted]
             if not modules:
-                if not args.silent:
-                    log.error(f"No matching modules for: {', '.join(sorted(wanted))}")
+                logger.error(f"No matching modules for: {', '.join(sorted(wanted))}")
                 return 2
 
         echo_cmd = g.verbose and (not args.silent)
@@ -342,7 +466,7 @@ def main() -> int:
 
         # local sudo prefix
         sudo_prefix: List[str] = []
-        if not args.target_host and (args.target_user != src_user) and sudo_allowed:
+        if not args.target_host and (args.target_user != _invoking_user()) and sudo_allowed:
             sudo_prefix = ["sudo", "--"]
 
         # remote rsync-path (sudo on the remote if allowed)
@@ -352,13 +476,11 @@ def main() -> int:
 
         try:
             for m in modules:
-                if not args.silent:
-                    log.title(_module_title(m.name))
+                logger.title(f"\n=== Module: {m.name} ===")
 
                 items_raw = read_list_file(m.list_file)
                 if not items_raw:
-                    if not args.silent:
-                        log.info(f"(skip) list empty: {m.list_file}")
+                    logger.warning(f"(skip) list empty: {m.list_file}")
                     continue
 
                 for raw in items_raw:
@@ -367,13 +489,12 @@ def main() -> int:
 
                     # ensure mapping from src_home
                     if not Path(abs_src).resolve().is_relative_to(Path(src_home).resolve()):
-                        if not args.silent:
-                            log.error(f"{disp}: must reside under source home {src_home}. Skipping.")
+                        logger.error(f"{disp}: must reside under source home {src_home}. Skipping.")
                         continue
 
                     abs_dst = map_src_to_dest(abs_src, src_home, dest_home).replace("$HOME", dest_home)
 
-                    # Preflight for single-file classification
+                    # Preflight
                     src_is_file = Path(abs_src).is_file()
                     src_exists = Path(abs_src).exists()
                     src_mtime = src_file_mtime(abs_src) if src_is_file else None
@@ -405,7 +526,7 @@ def main() -> int:
                         force_overwrite=args.overwrite,
                         chown=chown_str,
                         rsync_path=rsync_path,
-                        ssh_extra=ssh_extra,  # ensure rsync reuses the ControlMaster
+                        ssh_extra=ssh_extra,
                     )
                     if sudo_prefix:
                         cmd = sudo_prefix + cmd
@@ -431,39 +552,33 @@ def main() -> int:
                             copied = transferred_stats
                         deleted_total = deleted_stats
                         skipped = max(0, total_files - copied) if total_files > 0 else 0
-                        if not args.silent:
-                            if copied > 0:
-                                log.transfer(f"{disp}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}")
-                            elif deleted_total > 0:
-                                log.notice(f"{disp}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}")
-                            else:
-                                log.info(f"{disp}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}")
+                        if copied > 0:
+                            logger.transfer(f"{_resolve_env_path(disp)}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}")
+                        elif deleted_total > 0:
+                            logger.notice(f"{_resolve_env_path(disp)}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}")
+                        else:
+                            logger.notice(f"{_resolve_env_path(disp)}: DIR; {copied} copied, {deleted_total} deleted, {skipped} skipped.{chown_note}")
                     else:
                         source_missing = not src_exists
                         if source_missing:
                             if m.mirror and deleted_count > 0 and rc == 0:
-                                if not args.silent:
-                                    log.notice(f"{disp}: Target obsolete. DELETED file.{chown_note}")
+                                logger.notice(f"{_resolve_env_path(disp)}: Target obsolete. DELETED file.{chown_note}")
                             else:
-                                if not args.silent:
-                                    log.warning(f"{disp}: Neither source nor target file found. SKIPPING.")
+                                logger.warning(f"{_resolve_env_path(disp)}: Neither source nor target file found. SKIPPING.")
                         else:
                             transferred_any = (created_count + updated_count) > 0 or transferred_stats > 0
                             if transferred_any:
                                 if not dest_existed_before:
-                                    if not args.silent:
-                                        log.transfer(f"{disp}: Target not found. CREATED new file.{chown_note}")
+                                    logger.transfer(f"{_resolve_env_path(disp)}: Target not found. CREATED new file.{chown_note}")
                                 else:
                                     if (
                                         src_mtime is not None
                                         and dest_mtime_before is not None
                                         and src_mtime > dest_mtime_before
                                     ):
-                                        if not args.silent:
-                                            log.transfer(f"{disp}: Target out of date. UPDATED file.{chown_note}")
+                                        logger.transfer(f"{_resolve_env_path(disp)}: Target out of date. UPDATED file.{chown_note}")
                                     else:
-                                        if not args.silent:
-                                            log.transfer(f"{disp}: Target out of date. UPDATED file.{chown_note}")
+                                        logger.transfer(f"{_resolve_env_path(disp)}: Target out of date. UPDATED file.{chown_note}")
                             else:
                                 if dest_existed_before:
                                     if (
@@ -471,33 +586,29 @@ def main() -> int:
                                         and dest_mtime_before is not None
                                         and src_mtime <= dest_mtime_before
                                     ):
-                                        if not args.silent:
-                                            log.info(f"{disp}: Target identical, SKIPPED file.")
+                                        logger.notice(f"{_resolve_env_path(disp)}: Target identical, SKIPPED file.")
                                     else:
-                                        if not args.silent:
-                                            log.info(f"{disp}: Target identical, SKIPPED file.")
+                                        logger.notice(f"{_resolve_env_path(disp)}: Target identical, SKIPPED file.")
                                 else:
-                                    if not args.silent:
-                                        log.info(f"{disp}: SKIPPED file.")
+                                    logger.notice(f"{_resolve_env_path(disp)}: SKIPPED file.")
                     if rc != 0:
                         rc_all = rc
 
-        except PermissionError as e:
-            if _is_local_target(args.target_host) and not _is_unix_root():
-                _reexec_with_sudo(sys.argv, log=log, reason_path=(e.filename or "Filesystem access"))
+        except PermissionError:
+            # We only re-exec in the explicit early check; if we get here, just bubble up
             raise
         except OSError as e:
-            if (
-                e.errno == errno.EACCES
-                and _is_local_target(args.target_host)
-                and not _is_unix_root()
-            ):
-                _reexec_with_sudo(sys.argv, log=log, reason_path=getattr(e, "filename", "Filesystem access"))
+            if e.errno == errno.EACCES and _is_local_target(args.target_host) and not _is_unix_root():
+                # Persist and exec (rare fallback)
+                os.environ[STATE_ENV] = str(state_file)
+                buf.add("Permission:   ERROR during operation; restarting with sudo…")
+                buf.write_and_close()
+                reexec_with_sudo(["--sudo", *sys.argv[1:]])
             raise
 
         elapsed = time.time() - start_time
-        log.title("\n=== Summary ===")
-        log.info(_kv_lines([
+        logger.title("\n=== Summary ===")
+        logger.info(_kv_lines([
             ("Modules processed",   str(len(modules))),
             ("Directories synced",  str(total_dirs)),
             ("Files processed",     str(total_files)),
@@ -508,10 +619,31 @@ def main() -> int:
         ]))
         return rc_all
 
-
     finally:
         if control_path:
             stop_ssh_master(control_path)
+
+
+def _extract_summary_stats(out: str) -> dict[str, float]:
+    stats = {"bytes": 0.0, "deleted": 0.0, "speedup": 0.0}
+    m = _RBYTES_RE.search(out)
+    if m:
+        stats["bytes"] = float(m.group(1).replace(",", ""))
+    m = _RSPEED_RE.search(out)
+    if m:
+        stats["speedup"] = float(m.group(1))
+    deleted_match = re.search(r"Number of deleted files:\s*([0-9]+)", out)
+    if deleted_match:
+        stats["deleted"] = float(deleted_match.group(1))
+    return stats
+
+
+def _human_bytes(num: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if num < 1024:
+            return f"{num:,.1f} {unit}"
+        num /= 1024
+    return f"{num:,.1f} PiB"
 
 
 if __name__ == "__main__":

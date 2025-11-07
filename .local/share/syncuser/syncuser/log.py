@@ -11,10 +11,10 @@ try:
 except Exception:
     pass
 
-# ----- levels -----
-TITLE_LVL = 15  # custom (between DEBUG and INFO)
-TRANSFER_LVL = 22  # custom
-NOTICE_LVL = 25  # custom
+# ----- custom levels -----
+TITLE_LVL = 15  # between DEBUG (10) and INFO (20)
+TRANSFER_LVL = 22  # between INFO (20) and WARNING (30)
+NOTICE_LVL = 25  # between WARNING (30) and ERROR (40)
 
 logging.addLevelName(TITLE_LVL, "TITLE")
 logging.addLevelName(TRANSFER_LVL, "TRANSFER")
@@ -41,87 +41,89 @@ logging.Logger.transfer = _logger_transfer  # type: ignore[attr-defined]
 logging.Logger.notice = _logger_notice  # type: ignore[attr-defined]
 
 
+# ----- coloring policy -----
+# Console colors (hex) per level
+CONSOLE_LINE_COLORS = {
+    "TRANSFER": "#94e2d5",
+    "NOTICE": "#f9e2af",
+    "WARNING": "#ef9f76",
+    "ERROR": "#e78284",
+}
+
+TITLE_FG = "#eff1f5"
+INFO_FG = "#e6e9ef"
+
+TIME_FMT = "%Y-%m-%d %H:%M:%S"
+FULL_FMT = "%(asctime)s %(levelname)s %(message)s"
+BANNER_FMT = "%(message)s"
+
+
 class ColorFormatter(logging.Formatter):
     """
-    Console coloring:
-      TITLE   -> white, bold, no timestamp/level
-      INFO    -> white, non-bold, no timestamp/level   (banner lines)
-      DEBUG   -> white
-      TRANSFER-> green
-      NOTICE  -> sand
-      WARNING -> amber
-      ERROR   -> red
-      CRITICAL-> red, bold
+    Console formatter:
+      - TITLE: bold, colored message only (no ts/level)
+      - INFO : colored message only (no ts/level)
+      - Others (NOTICE/TRANSFER/WARNING/ERROR): full line with ts/level, whole line colored
     """
 
-    COLORS = {
-        # "TITLE": "#ffffff",
-        # "INFO": "#ffffff",
-        # "DEBUG": "#ffffff",
-        "TRANSFER": "#a6da95",
-        "NOTICE": "#e5c890",
-        "WARNING": "#f5c542",
-        "ERROR": "#e78284",
-        "CRITICAL": "#e78284",
-    }
-
-    def __init__(
-        self,
-        fmt: str,
-        datefmt: str | None = None,
-        enable: bool = True,
-        for_banner: bool = False,
-    ):
-        super().__init__(fmt, datefmt)
-        self.enable = enable
-        self.for_banner = for_banner
+    def __init__(self, fmt: str, datefmt: str | None, enable_color: bool):
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self.enable_color = enable_color
 
     def format(self, record: logging.LogRecord) -> str:
-        # Banner lines (TITLE / INFO): raw message, styled, no ts/level on console
-        if self.for_banner and record.levelname in ("TITLE", "INFO"):
+        # --- pad levelname so output aligns neatly ---
+        max_len = 8  # or compute dynamically if you prefer
+        record.levelname = f"{record.levelname:<{max_len}}"
+
+        # TITLE banner: bold, no timestamp/level
+        if record.levelno == TITLE_LVL:
             msg = record.getMessage()
-            if self.enable:
-                bold = record.levelname == "TITLE"
-                msg = colorize(msg, bold=bold)
+            if self.enable_color:
+                msg = colorize(msg, fg=TITLE_FG, bold=True)
             return msg
 
-        if not self.enable:
-            return super().format(record)
+        # INFO banner: non-bold, no timestamp/level
+        if record.levelno == logging.INFO and self._fmt == BANNER_FMT:
+            msg = record.getMessage()
+            if self.enable_color:
+                msg = colorize(msg, fg=INFO_FG, bold=False)
+            return msg
 
-        orig_level = record.levelname
-        color = self.COLORS.get(orig_level)
-        try:
-            if color:
-                bold = record.levelno >= logging.CRITICAL or orig_level == "TITLE"
-                record.levelname = colorize(orig_level, fg=color, bold=bold)
-            return super().format(record)
-        finally:
-            record.levelname = orig_level
+        # normal coloring path
+        line = super().format(record)
+        if self.enable_color:
+            fg = CONSOLE_LINE_COLORS.get(record.levelname.strip())
+            if fg:
+                return colorize(line, fg=fg, bold=False)
+        return line
 
 
-class _BannerAwareConsole(logging.StreamHandler):
-    """Console handler: TITLE/INFO without timestamp/level; others colored & timestamped."""
+class BannerAwareConsole(logging.StreamHandler):
+    """
+    Console handler:
+      - TITLE printed with BANNER_FMT (no ts/level), bold, #eff1f5
+      - INFO  printed with BANNER_FMT (no ts/level), non-bold, #e6e9ef
+      - Others printed with FULL_FMT + TIME_FMT, whole line colored per level
+    """
 
-    def __init__(self, color_ok: bool, fmt_default: str, fmt_banner: str) -> None:
+    def __init__(self, color_ok: bool):
         super().__init__()
-        self._color_ok = color_ok
-        self._fmt_default = fmt_default
-        self._fmt_banner = fmt_banner
+        self.color_ok = color_ok
+        self.banner_fmt = ColorFormatter(BANNER_FMT, None, enable_color=color_ok)
+        self.full_fmt = ColorFormatter(FULL_FMT, TIME_FMT, enable_color=color_ok)
 
     def emit(self, record: logging.LogRecord) -> None:  # type: ignore[override]
-        if record.levelname in ("TITLE", "INFO"):
-            self.setFormatter(
-                ColorFormatter(self._fmt_banner, enable=self._color_ok, for_banner=True)
-            )
+        if record.levelno in (TITLE_LVL, logging.INFO):
+            self.setFormatter(self.banner_fmt)
         else:
-            self.setFormatter(ColorFormatter(self._fmt_default, enable=self._color_ok))
+            self.setFormatter(self.full_fmt)
         super().emit(record)
 
 
-class _ExcludeLevelFilter(logging.Filter):
-    """Filter out a specific level from a handler (used to drop TITLE from file)."""
+class ExcludeLevelFilter(logging.Filter):
+    """Filter out a specific level (used to drop TITLE from file logs)."""
 
-    def __init__(self, levelno: int) -> None:
+    def __init__(self, levelno: int):
         super().__init__()
         self.levelno = levelno
 
@@ -133,9 +135,9 @@ def setup_logging(
     log_file: Path | None, verbose: bool, silent: bool = False
 ) -> logging.Logger:
     """
-    - silent=True  -> no console/file output at all
+    - silent=True  -> no console/file output
     - verbose=True -> console DEBUG, file DEBUG
-    - verbose=False-> console INFO (but include TITLE/INFO banners), file DEBUG (if log_file set)
+    - verbose=False-> console INFO+ (incl. TITLE), file DEBUG (if provided)
     """
     log = logging.getLogger("syncuser")
     log.setLevel(logging.DEBUG)
@@ -147,25 +149,24 @@ def setup_logging(
         log.addHandler(logging.NullHandler())
         return log
 
-    fmt_default = "%(asctime)s [%(levelname)s] %(message)s"
-    fmt_banner = "%(message)s"
-
-    # console
+    # Console
     color_ok = supports_color(sys.stderr)
-    ch = _BannerAwareConsole(color_ok, fmt_default, fmt_banner)
-    ch.setLevel(logging.DEBUG if verbose else TITLE_LVL)
+    ch = BannerAwareConsole(color_ok)
+    ch.setLevel(
+        logging.DEBUG if verbose else TITLE_LVL
+    )  # includes TITLE + INFO; hides DEBUG unless verbose
     log.addHandler(ch)
 
-    # file
+    # File
     if log_file:
         log_path = Path(log_file).expanduser()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_path, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
-        fh.addFilter(
-            _ExcludeLevelFilter(TITLE_LVL)
-        )  # exclude TITLE only; keep INFO banners
-        fh.setFormatter(logging.Formatter(fmt_default))
+        fh.addFilter(ExcludeLevelFilter(TITLE_LVL))  # hide TITLE in file
+        fh.setFormatter(
+            logging.Formatter(FULL_FMT, TIME_FMT)
+        )  # INFO and others are timestamped in file
         log.addHandler(fh)
 
     return log

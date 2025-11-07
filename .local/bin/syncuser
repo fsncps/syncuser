@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="syncuser"
+BASE="${HOME}/.local/share/${APP_NAME}"
+VENV="${BASE}/.venv"
+PY="${VENV}/bin/python3"
+
+[ -x "${PY}" ] || {
+	echo "[err] ${PY} not found; run install.sh first." >&2
+	exit 1
+}
+
+# Export a stable base for any re-exec the app might do
+export SYNCUSER_BASE="${BASE}"
+
+# Keep working even if someone clears the environment
+export PYTHONPATH="${BASE}${PYTHONPATH+:$PYTHONPATH}"
+
+exec "${PY}" -m syncuser "$@"
