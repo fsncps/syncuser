@@ -103,9 +103,16 @@ def count_sync_files(abs_path: Path, exclude_patterns: tuple[str, ...]) -> int:
     return total
 
 
-def read_list_file(path: Path) -> list[str]:
+def read_list_file(path: Path, *, logger: logging.Logger | None = None) -> list[str]:
+    """
+    Read a module list file. If not found, log an error and return [] so the caller
+    can SKIP the module instead of exiting the whole run.
+    """
     if not path.exists():
-        raise SystemExit(f"List file not found: {path}")
+        if logger:
+            logger.error(f"(skip) list file not found: {path}")
+        return []
+
     out: list[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         s = raw.strip()

@@ -2,6 +2,7 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+import os
 from typing import Sequence
 from .config import General, Module
 
@@ -17,6 +18,11 @@ def parse_stats(rsync_output: str) -> tuple[int, int]:
     transferred = int(m1.group(1)) if m1 else 0
     deleted = int(m2.group(1)) if m2 else 0
     return transferred, deleted
+
+
+def _slash_dir(p: str) -> str:
+    # keep "user@host:/abs" intact; just ensure final slash
+    return p.rstrip("/") + "/"
 
 
 def run_capture(
@@ -127,5 +133,9 @@ def build_rsync_cmd(
     if chown:
         cmd += [f"--chown={chown}"]
 
+    if os.path.isdir(src_path):
+        src_path = _slash_dir(src_path)
+        dst_path = _slash_dir(dst_path)
     cmd += [src_path, dst_path]
+
     return cmd

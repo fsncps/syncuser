@@ -2,14 +2,13 @@
 list_dir = "~/.config/syncuser"
 log_file = "~/.local/share/syncuser/syncuser.log"
 rsync_bin = "/usr/bin/rsync"
-prompt_sudo_passwd = false
 dry_run = false
 verbose = false
-lan_progress = true
-show_stats = true
+lan_progress = false
+show_stats = false
 
 # Optional global rsync excludes (patterns)
-exclude = [".git", ".DS_Store", "*.swp"]
+exclude = [".git", ".DS_Store", "*.swp", "*~"]
 
 [modules.appconfig]
 # If omitted, defaults to "appconfig.list"
@@ -25,4 +24,14 @@ mirror = false
 overwrite_if_newer_mtime = false
 overwrite_all = false
 backup = false
-#backup_suffix = ".bak"
+
+[modules.static_dotfiles]
+mirror = false
+overwrite_if_newer_mtime = true
+overwrite_all = false
+backup = false
+
+[modules.bin]
+mirror = false
+overwrite_all = true
+backup = false
