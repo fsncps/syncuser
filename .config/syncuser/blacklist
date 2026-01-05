@@ -1,0 +1,3 @@
+# Blacklist: files and dirs to be skipped
+
+$HOME/.bashrc.d/secrets
