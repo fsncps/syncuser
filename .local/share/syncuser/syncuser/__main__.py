@@ -8,7 +8,11 @@ from typing import List
 from .config import load_config
 from .log import setup_logging
 from .tools import ssh, identity, misc, log_utils
-from .sync import build_rsync_cmd, run_capture, parse_stats, parse_itemize
+from .sync import (
+    build_rsync_cmd,
+    run_capture,
+)
+
 
 ELEVATION_ENV_FLAG = "SYNCUSER_ELEVATED"
 STATE_ENV = "SYNCUSER_STATE_FILE"
@@ -325,6 +329,37 @@ def main() -> int:
                     )
                     chown_note = f" (chown {chown_str})" if chown_str else ""
 
+                    # Ensure destination path exists (mkdir -p), unless rsync has --mkpath.
+                    use_mkpath = misc.rsync_supports_mkpath(g.rsync_bin)
+
+                    # For remote mkdir: decide whether we need sudo.
+                    remote_mkdir_sudo = bool(
+                        rsync_path and rsync_path.strip().startswith("sudo")
+                    )
+
+                    if not g.dry_run:
+                        try:
+                            misc.ensure_dst_dir(
+                                g,
+                                src_path=abs_src,
+                                dst_path=abs_dst,  # plain absolute path
+                                dst_host=args.target_host,  # None => local
+                                ssh_extra=ssh_extra,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"{misc.resolve_env_path(disp)}: failed to create destination path "
+                                f"{abs_dst} ({e}). SKIPPING.{dry_tag}"
+                            )
+                            rc_all = 1
+                            continue
+
+                    dst_path_for_rsync = (
+                        f"{args.target_user}@{args.target_host}:{abs_dst}"
+                        if args.target_host
+                        else abs_dst
+                    )
+
                     cmd = build_rsync_cmd(
                         g,
                         m,
@@ -335,19 +370,26 @@ def main() -> int:
                         chown=chown_str,
                         rsync_path=rsync_path,
                         ssh_extra=ssh_extra,
+                        # if you add it: use_mkpath=use_mkpath
                     )
+
+                    # If build_rsync_cmd does not add --mkpath itself, do it here:
+                    if use_mkpath and "--mkpath" not in cmd:
+                        # place early; after binary but before args is fine
+                        cmd.insert(1, "--mkpath")
+
                     if sudo_prefix:
                         cmd = sudo_prefix + cmd
 
                     rc, out, err = run_capture(cmd, echo=echo_rsync, echo_cmd=echo_cmd)
 
                     combined = f"{out}\n{err}"
-                    it = parse_itemize(combined)
+                    it = misc.parse_itemize(combined)
                     created_count = it["created"]
                     updated_count = it["updated"]
                     deleted_count = it["deleted"]
 
-                    transferred_stats, deleted_stats = parse_stats(combined)
+                    transferred_stats, deleted_stats = misc.parse_stats(combined)
                     is_dir = Path(abs_src).is_dir()
 
                     stats = misc.extract_summary_stats(combined)
